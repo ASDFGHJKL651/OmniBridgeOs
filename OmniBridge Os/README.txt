@@ -100,32 +100,29 @@ OmniBridgeOs/
 │   │   ├── idt.c / idt.h     # IDT 初始化与异常处理
 │   │   ├── serial.c / serial.h
 │   │   ├── printk.c / printk.h
-│   │   └── boot.h            # 内核 LMA/VMA 与 boot_info
-│   ├── mm/
+│   │   ├── boot.h            # 内核 LMA/VMA 与 boot_info
 │   │   ├── pmm.c / pmm.h     # 伙伴系统物理内存管理
 │   │   ├── vmm.c / vmm.h     # 4 级页表与内核高半区映射
-│   │   └── kmalloc.c / kmalloc.h # SLAB 分配器
-│   └── main.c                # _kstart_c 内核 C 入口
+│   │   ├── kmalloc.c / kmalloc.h # SLAB 分配器
+│   │   └── main.c                # _kstart_c 内核 C 入口
 ├── scripts/
 │   ├── build.ps1
 │   ├── run-qemu.ps1
 │   ├── run-qemu.sh
 │   ├── setup-toolchain.ps1
 │   ├── setup-toolchain.sh
+│   ├── pe_to_elf.py          # PE32+ -> ELF64 转换工具
 │   └── check-serial.ps1
 ├── tests/
 │   ├── test_serial.c
 │   ├── test_vmm.c
 │   ├── test_pmm.c
 │   └── test_kmalloc.c
-├── tools/
-│   └── pe_to_elf.py          # PE32+ -> ELF64 转换工具
 ├── build/                    # 构建输出
 │   ├── esp/EFI/BOOT/BOOTX64.EFI
 │   └── serial.log
 └── README.txt
 
-注：目录结构根据当前文件推断，实际可能略有差异。
 
 ===============================================================================
 4. 构建与运行环境
@@ -389,26 +386,9 @@ QEMU 内测试通过串口日志校验脚本进行：
 
   .\scripts\check-serial.ps1
 
-===============================================================================
-10. 参考文档
-===============================================================================
-
-  - OmniBridgeOS开发规划.txt
-  - OmniBridgeOs系统开发要求.txt
-  - elf.c / elf.h
-  - file.c / file.h
-  - main.c（UEFI）
-  - page.c / page.h
-  - trampoline.S
-  - entry.S / entry_kernel.S
-  - gdt.c / idt.c
-  - pmm.c / vmm.c / kmalloc.c
-  - build.ps1 / run-qemu.ps1 / check-serial.ps1
-  - setup-toolchain.sh
-  - serial.log
 
 ===============================================================================
-11. 贡献与审查原则
+10. 贡献与审查原则
 ===============================================================================
 
 AI 可生成：
@@ -426,7 +406,7 @@ AI 可生成：
   - AI 只生成框架/伪代码，人工重写或逐行验证。
 
 ===============================================================================
-最终结论
+当前进度
 ===============================================================================
 
 当前进度：
