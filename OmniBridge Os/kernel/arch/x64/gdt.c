@@ -1,5 +1,7 @@
 #include "gdt.h"
+#include "tss.h"
 #include "printk.h"
+#include "serial.h"
 
 struct gdt_entry {
     uint16_t limit_low;
@@ -15,8 +17,11 @@ struct gdt_ptr {
     uint64_t base;
 } __attribute__((packed));
 
-static struct gdt_entry g_gdt[5];
+/* 7 个条目：0..4 普通段，5/6 = 16 字节 TSS 描述符 */
+static struct gdt_entry g_gdt[7];
 static struct gdt_ptr   g_gdtp;
+
+extern void gdt_flush(uint64_t gdtp_addr);
 
 static void set_gate(int i, uint8_t access, uint8_t gran)
 {
@@ -28,28 +33,48 @@ static void set_gate(int i, uint8_t access, uint8_t gran)
     g_gdt[i].base_high   = 0x00;
 }
 
-extern void gdt_flush(uint64_t gdtp_addr);
+/* 64 位 TSS 描述符（16 字节，占 g_gdt[i] 与 g_gdt[i+1]） */
+static void set_tss_descriptor(int i, uint64_t base, uint32_t limit)
+{
+    /* 低 8 字节 */
+    g_gdt[i].limit_low   = (uint16_t)(limit & 0xFFFF);
+    g_gdt[i].base_low    = (uint16_t)(base & 0xFFFF);
+    g_gdt[i].base_mid    = (uint8_t)((base >> 16) & 0xFF);
+    g_gdt[i].access      = 0x89;    /* P=1, DPL=0, S=0, type=1001b */
+    g_gdt[i].granularity = (uint8_t)((limit >> 16) & 0x0F);
+    g_gdt[i].base_high   = (uint8_t)((base >> 24) & 0xFF);
+
+    /* 高 8 字节：base[63:32]，其余为 0 */
+    g_gdt[i + 1].limit_low   = (uint16_t)((base >> 32) & 0xFFFF);
+    g_gdt[i + 1].base_low    = (uint16_t)((base >> 48) & 0xFFFF);
+    g_gdt[i + 1].base_mid    = 0;
+    g_gdt[i + 1].access      = 0;
+    g_gdt[i + 1].granularity = 0;
+    g_gdt[i + 1].base_high   = 0;
+}
 
 void gdt_init(void)
 {
-    /* 0: null */
-    for (int i = 0; i < 6; ++i) {
-        ((uint8_t *)&g_gdt[0])[i] = 0;
-    }
-    set_gate(0, 0x00, 0x00);
+    /* 0：null 描述符 */
+    for (int i = 0; i < 8; ++i) ((uint8_t *)&g_gdt[0])[i] = 0;
 
-    /* 1: kernel code  (0x9A = present|DPL0|code|read, 0xA0 = long mode) */
-    set_gate(1, 0x9A, 0xA0);
-    /* 2: kernel data  (0x92 = present|DPL0|data|write) */
-    set_gate(2, 0x92, 0xA0);
-    /* 3: user code 32 (兼容位，未用) */
-    set_gate(3, 0xFA, 0xA0);
-    /* 4: user data */
-    set_gate(4, 0xF2, 0xA0);
+    /* 1..4 普通段 */
+    set_gate(1, 0x9A, 0xA0);   /* kernel code */
+    set_gate(2, 0x92, 0xA0);   /* kernel data */
+    set_gate(3, 0xFA, 0xA0);   /* user code */
+    set_gate(4, 0xF2, 0xA0);   /* user data */
 
-    g_gdtp.limit = sizeof(g_gdt) - 1;
-    g_gdtp.base  = (uint64_t)&g_gdt[0];
+    /* 5/6：TSS 描述符 */
+    struct tss_entry *t = tss_get();
+    set_tss_descriptor(5, (uint64_t)(uintptr_t)t, (uint32_t)(sizeof(*t) - 1));
 
-    gdt_flush((uint64_t)&g_gdtp);
-    printk("[GDT] loaded\n");
+    g_gdtp.limit = (uint16_t)(sizeof(g_gdt) - 1);
+    g_gdtp.base  = (uint64_t)(uintptr_t)&g_gdt[0];
+
+    gdt_flush((uint64_t)(uintptr_t)&g_gdtp);
+
+    serial_printf("[GDT] loaded 7 entries (null|kcode|kdata|ucode|udata|TSS.lo|TSS.hi)\n");
+    serial_printf("[GDT] TSS base=0x%llx limit=0x%x sel=0x28\n",
+                  (unsigned long long)(uint64_t)(uintptr_t)t,
+                  (unsigned)(sizeof(*t) - 1));
 }
