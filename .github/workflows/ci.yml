@@ -1,0 +1,45 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-nasm
+            qemu
+            edk2-ovmf
+            diffutils
+
+      - name: Build
+        run: make all
+
+      - name: Host tests
+        run: make test && make -C tests/host run
+
+      - name: Run QEMU + check serial
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/run-qemu.ps1
+          powershell -ExecutionPolicy Bypass -File scripts/check-serial.ps1
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-log
+          path: build/serial.log

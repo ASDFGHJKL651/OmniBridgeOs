@@ -1,3 +1,4 @@
+/*===OmniBridgeOs/boot/uefi/elf.h===*/
 #ifndef OMNIBRIDGE_UEFI_ELF_H
 #define OMNIBRIDGE_UEFI_ELF_H
 
@@ -32,15 +33,21 @@ typedef struct {
     uint64_t p_align;
 } Elf64_Phdr;
 
-/* 校验 ELF 头并把 PT_LOAD 段按 p_paddr 复制到物理内存，BSS 清零。
+/*
+ * 校验 ELF 头并把 PT_LOAD 段按 p_paddr 复制到物理内存，BSS 清零。
  *
- *   vma_base  —— 镜像的虚拟基址（例如 OB_KERNEL_VMA）
- *   out_entry —— e_entry（虚拟地址）
- *   out_lma_base —— 镜像物理基址 = p_paddr - (p_vaddr - vma_base)
- *                   对于所有 PT_LOAD 应恒等；任一 PT_LOAD 都能推出。
+ *   vma_base      —— 镜像虚拟基址（如 OB_KERNEL_VMA）
+ *   out_entry     —— e_entry（虚拟地址）
+ *   out_lma_base  —— 镜像物理基址
+ *   out_phys_end  —— ★ 新增：所有 PT_LOAD 段 p_paddr + p_memsz 的最大值
+ *                    如果 out_phys_end == NULL，则不输出。
+ *                    该值用于 pmm_init 排除内核物理范围。
  */
 EFI_STATUS elf_load(const void *image, UINTN image_size,
                     uint64_t vma_base,
-                    void **out_entry, uint64_t *out_lma_base);
+                    void **out_entry,
+                    uint64_t *out_lma_base,
+                    uint64_t *out_phys_end);
 
 #endif
+/*===OmniBridgeOs/boot/uefi/elf.h 结束===*/

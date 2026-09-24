@@ -1,3 +1,4 @@
+/*===OmniBridgeOs/boot/uefi/main.c===*/
 #include "uefi_min.h"
 #include "file.h"
 #include "elf.h"
@@ -71,21 +72,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     serial_printf("[UEFI] kernel.elf loaded, %llu bytes\n",
                   (unsigned long long)elf_size);
 
-    /* ---------- 2) 解析 ELF，按 p_paddr 复制到物理内存 ---------- */
+    /* ---------- 2) 解析 ELF，按 p_paddr 复制到物理内存 ----------
+     *
+     * ★ 第 18C 步修复：
+     *   elf_load 现在额外输出 kernel_phys_end（所有 PT_LOAD 段的
+     *   p_paddr + p_memsz 的最大值）。该值被写入 boot_info，供内核
+     *   pmm_init 排除内核镜像物理范围，避免用户程序覆写内核 BSS。
+     */
     void *entry_va = 0;
     uint64_t kernel_lma = 0;
+    uint64_t kernel_phys_end = 0;
     st = elf_load(elf_buf, elf_size,
-                  OB_KERNEL_VMA,           /* ← 新增 */
-                  &entry_va, &kernel_lma);
+                  OB_KERNEL_VMA,
+                  &entry_va, &kernel_lma, &kernel_phys_end);
     if (EFI_ERROR(st)) fail_and_halt("elf_load", st);
-    serial_printf("[UEFI] ELF entry=%p LMA=%p\n",
-                  entry_va, (void *)(uintptr_t)kernel_lma);
+    serial_printf("[UEFI] ELF entry=%p LMA=%p phys_end=0x%llx\n",
+                  entry_va, (void *)(uintptr_t)kernel_lma,
+                  (unsigned long long)kernel_phys_end);
 
-    /* 与 boot.h 中的 OB_KERNEL_LMA 严格比对 */
     if (kernel_lma != OB_KERNEL_LMA) {
         fail_and_halt("kernel LMA mismatch (expect OB_KERNEL_LMA)",
                       EFI_LOAD_ERROR);
     }
+
+    /* ★ 第 18C 步：填充内核物理范围字段。
+     *
+     * 人工必须审查：
+     *   - kernel_phys_start = 内核加载基址（OB_KERNEL_LMA）。
+     *   - kernel_phys_end   = 所有 PT_LOAD 段 p_paddr + p_memsz 的最大值。
+     *   - 若 kernel_phys_end == 0（理论上不应发生），内核 pmm_init 会
+     *     使用保守默认范围 [0x200000, 0x400000)。 */
+    g_boot_info.kernel_phys_start = kernel_lma;
+    g_boot_info.kernel_phys_end   = kernel_phys_end;
 
     /* ---------- 3) 获取内存图 ---------- */
     UINTN map_size = sizeof(g_memory_map_buf);
@@ -115,9 +133,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_boot_info.memory_map[i].attribute       = d->Attribute;
     }
 
-    /* ---------- 4) 建立初始页表并加载 CR3 ---------- */
-    uefi_build_page_tables(kernel_lma);
-    serial_printf("[UEFI] page tables built\n");
+    /* ---------- 4) 建立初始页表（★ 不切换 CR3） ----------
+     *
+     * ★ 关键修复：
+     *   原实现会在这里执行 `mov %cr3`，导致 OVMF 内部残留事件
+     *   （尤其是 VirtIO 网卡 UEFI 驱动）在自定义页表下运行，
+     *   访问 MMIO 时触发 #PF。
+     *
+     *   现在改为：仅构造页表，把 PML4 的物理地址返回，
+     *   由本函数在 ExitBootServices 成功之后再手动切换。
+     */
+    void *pml4_phys = 0;
+    uefi_build_page_tables(kernel_lma, &pml4_phys);
+    serial_printf("[UEFI] page tables built, pml4=0x%llx\n",
+                  (unsigned long long)pml4_phys);
 
     /* ---------- 5) 退出 BootServices ---------- */
     st = bs->ExitBootServices(ImageHandle, map_key);
@@ -133,13 +162,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     serial_printf("[UEFI] Boot Services exited\n");
 
-    /* ---------- 6) 跳转到内核 VMA ---------- */
+    /* ---------- 6) 切换 CR3，然后跳转到内核 VMA ---------- */
     serial_printf("[UEFI] handoff to kernel at %p, entries=%u\n",
                   entry_va, (unsigned)g_boot_info.entry_count);
 
-    /* 自此不再调用任何 Boot Services。
-     * 串口输出仍然可用（端口 I/O 直接操作 0x3F8）。 */
+    /*
+     * ★ 关键：CR3 切换必须放在 ExitBootServices 之后。
+     *   到此为止 UEFI 侧的所有异步事件/驱动回调都已停止，不会再有人
+     *   在错误的页表下访问内存。
+     *
+     *   切换后当前 RIP / RSP / 数据段 / 栈（全部位于 0..4GB 恒等映射内）
+     *   仍然有效，随后即跳入内核高半区。
+     */
+    __asm__ __volatile__(
+        "mov %0, %%cr3\n\t"
+        :
+        : "r"((uint64_t)(uintptr_t)pml4_phys)
+        : "memory");
+
     uefi_jump_to_kernel(&g_boot_info, entry_va);
 
     for (;;) { __asm__ __volatile__("hlt"); }
 }
+/*===OmniBridgeOs/boot/uefi/main.c 结束===*/

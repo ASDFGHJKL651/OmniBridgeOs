@@ -18,11 +18,15 @@ static void zero(uint64_t *p)
     for (int i = 0; i < 512; ++i) p[i] = 0;
 }
 
-/* 人工必须审查：
- *   - 加载新 CR3 后，当前 RIP 与 RSP 必须仍在映射中（恒等映射覆盖 UEFI 镜像物理地址）
- *   - kernel_lma 必须 2MB 对齐
- *   - 内核镜像区域必须是 RWH（可执行），不能带 NX，否则取指立即 #PF */
-void uefi_build_page_tables(uint64_t kernel_lma)
+/*
+ * 人工必须审查：
+ *   - 只构造页表，不切换 CR3。切换由 main.c 在 ExitBootServices 之后执行。
+ *   - kernel_lma 必须 2MB 对齐。
+ *   - 内核镜像区域必须是 RWH（可执行），不能带 NX，否则取指立即 #PF。
+ *   - UEFI 环境为恒等映射，因此 PML4/PDPT/PD 的"虚拟地址"就是"物理地址"，
+ *     直接把数组地址写入页表项即可。
+ */
+void uefi_build_page_tables(uint64_t kernel_lma, void **out_pml4_phys)
 {
     zero(pml4); zero(pdpt_lo); zero(pdpt_dm); zero(pdpt_k);
     for (int i = 0; i < 4; ++i) { zero(pd_lo[i]); zero(pd_dm[i]); }
@@ -55,5 +59,16 @@ void uefi_build_page_tables(uint64_t kernel_lma)
     for (int i = 0; i < 512; ++i)
         pd_k[i] = (kernel_lma + ((uint64_t)i << 21)) | RWH;
 
-    __asm__ __volatile__("mov %0, %%cr3" :: "r"((uint64_t)pml4) : "memory");
+    /*
+     * ★ 不再在此切换 CR3。
+     *   调用者（main.c）会在 ExitBootServices 之后、跳转内核之前，
+     *   用 out_pml4_phys 中的值执行 `mov %cr3`。
+     *   这避免了 OVMF 内部的异步事件/驱动回调（例如 VirtIO 网卡 UEFI
+     *   驱动）在错误的页表下运行导致的 #PF。
+     *
+     *   注：UEFI 环境是恒等映射，pml4 数组的虚拟地址 = 物理地址。
+     */
+    if (out_pml4_phys) {
+        *out_pml4_phys = (void *)pml4;
+    }
 }
