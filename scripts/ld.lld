@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# 强制把 argv[0] 设为 "ld.lld"，让 LLD 进入 Gnu flavor。
-# 用法：ld.lld <真实 lld 路径> [ld 参数...]
-set -e
-REAL_LLD="$1"
-shift
-exec -a ld.lld "$REAL_LLD" "$@"

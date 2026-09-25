@@ -1,53 +1,95 @@
+/*===OmniBridgeOs/kernel/arch/x64/syscall.h===*/
 #ifndef OMNIBRIDGE_SYSCALL_H
 #define OMNIBRIDGE_SYSCALL_H
 
 #include <stdint.h>
 
-/*
- * SYSCALL 进入时的寄存器现场。
- *
- * 必须与 entry.S 中 syscall_entry 的 push 顺序严格一致。
- * 栈布局（从低地址到高地址，也即 offset 0 起）：
- *
- *   offset  0  : r15
- *   offset  8  : r14
- *   offset 16  : r13
- *   offset 24  : r12
- *   offset 32  : r11   （SYSCALL 硬件写入的用户 RFLAGS）
- *   offset 40  : r10   （arg3）
- *   offset 48  : r9
- *   offset 56  : r8
- *   offset 64  : rbp
- *   offset 72  : rdi   （arg0）
- *   offset 80  : rsi   （arg1）
- *   offset 88  : rdx   （arg2）
- *   offset 96  : rcx   （SYSCALL 硬件写入的用户返回 RIP）
- *   offset 104 : rbx
- *   offset 112 : rax   （系统调用号）
- *
- * 注意：rdi/rsi/rbp 的顺序必须与汇编 push 顺序一致——先 push rsi、
- * 再 push rdi、最后 push rbp，因此栈上从低到高是 rbp、rdi、rsi。
- */
 struct syscall_frame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
 };
 
-/*
- * 初始化 SYSCALL/SYSRET：
- *   - EFER.SCE = 1
- *   - STAR：内核 CS=0x08 / SS=0x10，用户基准 0x1B（当前 GDT 占位值）
- *   - LSTAR：syscall_entry 地址
- *   - FMASK：进入时清 IF/TF/DF/NT/AC
- */
-void syscall_init(void);
+#define SYS_OB_CreateProcess        0x100u
+#define SYS_OB_TerminateProcess     0x101u
+#define SYS_OB_GetProcessInfo       0x102u
+#define SYS_OB_SendSignal           0x103u
+#define SYS_OB_GetCurrentToken      0x104u
+#define SYS_OB_CheckAccess          0x105u
+#define SYS_OB_OpenFile             0x106u
+#define SYS_OB_ReadFile             0x107u
+#define SYS_OB_WriteFile            0x108u
+#define SYS_OB_CloseHandle          0x109u
+#define SYS_OB_VirtualAlloc         0x10Au
+#define SYS_OB_VirtualFree          0x10Bu
+#define SYS_OB_LoadDriver           0x10Cu
+#define SYS_OB_LoadDriverSandboxed  0x10Du
+#define SYS_OB_RegisterInterrupt    0x10Eu
+#define SYS_OB_CreateSandboxProcess 0x10Fu
+#define SYS_OB_Compat_Preload       0x110u
+#define SYS_OB_ReadKernelMemory     0x111u
+#define SYS_OB_WriteKernelMemory    0x112u
+#define SYS_OB_ReadKernelFile       0x113u
+#define SYS_OB_InternalSign         0x114u
+/* ★ 第 18 步：原生权限检查透传入口 */
+#define SYS_OB_CheckAccessNative    0x115u
 
-/*
- * syscall 骨架分发器：
- *   - 打印系统调用号与参数
- *   - 返回 -ENOSYS（-38）
- * 真正的 syscall_dispatcher 在后续步骤中实现。
+/* ★ 第 18A 步：网络系统调用 */
+#define SYS_OB_Socket       0x120u
+#define SYS_OB_Bind         0x121u
+#define SYS_OB_Listen       0x122u
+#define SYS_OB_Connect      0x123u
+#define SYS_OB_Send         0x124u
+#define SYS_OB_Recv         0x125u
+#define SYS_OB_CloseSocket  0x126u
+
+/* ★ 第 18C 步：用户态运行时系统调用（0x130 起，避开 18A 网络占用）
+ *
+ * 人工必须审查：
+ *   0x120u 段已被网络占用（18A）。0x130u 段专门给用户态运行时。
+ *   绝不能重新定义 SYS_OB_UserExit 为 0x120u —— 那会与 SYS_OB_Socket
+ *   冲突。此前版本曾用 "先 define 0x120u 再 #undef 再 define 0x130u"
+ *   的写法绕过，导致 usr/include/ob/ob.h 与其同时被 include 时
+ *   触发 -Wmacro-redefined 警告。本版已清理为单一定义。
  */
+#define SYS_OB_UserExit     0x130u
+#define SYS_OB_ThreadCreate 0x131u
+#define SYS_OB_ThreadJoin   0x132u
+#define SYS_OB_SigReturn    0x133u
+#define SYS_OB_FutexWait    0x134u
+#define SYS_OB_FutexWake    0x135u
+#define SYS_OB_TcSetpgrp    0x136u
+#define SYS_OB_TcGetpgrp    0x137u
+#define SYS_OB_SetFsBase    0x138u
+#define SYS_OB_Getpid       0x139u
+#define SYS_OB_Getppid      0x13Au
+#define SYS_OB_Sleep        0x13Bu
+#define SYS_OB_GetTime      0x13Cu
+#define SYS_OB_Brk          0x13Du
+#define SYS_OB_Sigaction    0x13Eu
+#define SYS_OB_Kill         0x13Fu
+/* ★ 第 18C 步：pthread 与 TLS 支撑 */
+#define SYS_OB_ThreadSpawn  0x140u  /* (entry, arg, ustack_top) -> tid */
+#define SYS_OB_ThreadWait   0x141u  /* (tid) -> exit_code */
+#define SYS_OB_GetTid       0x143u  /* () -> tid */
+/* ★ 第 18D 步：IPC、资源控制与命名空间 */
+#define SYS_OB_Pipe         0x150u   /* (int fds[2]) -> 0 */
+#define SYS_OB_ShmCreate    0x151u   /* (size) -> shm_id */
+#define SYS_OB_ShmMap       0x152u   /* (shm_id, uaddr) -> uaddr */
+#define SYS_OB_ShmUnmap     0x153u   /* (uaddr, size) -> 0 */
+#define SYS_OB_Poll         0x154u   /* (pollfd*, nfds, timeout_ms) -> nready */
+#define SYS_OB_Select       0x155u   /* (nfds, rfd*, wfd*, efd*, tv*) */
+#define SYS_OB_EpollCreate  0x156u
+#define SYS_OB_EpollCtl     0x157u
+#define SYS_OB_EpollWait    0x158u
+#define SYS_OB_SetCpuQuota  0x159u   /* (pid, quota) -> 0 */
+#define SYS_OB_SetMemQuota  0x15Au   /* (pid, pages) -> 0 */
+#define SYS_OB_Seccomp      0x15Bu   /* (mode, filter*) -> 0 */
+#define SYS_OB_Ptrace       0x15Cu   /* (request, pid, addr, data) */
+#define SYS_OB_Clone        0x15Du   /* (flags, stack) -> pid */
+#define SYS_OB_Unshare      0x15Eu   /* (flags) -> 0 */
+
+void syscall_init(void);
 int64_t syscall_dispatcher(struct syscall_frame *f);
 
-#endif
+#endif /* OMNIBRIDGE_SYSCALL_H */
+/*===OmniBridgeOs/kernel/arch/x64/syscall.h 结束===*/

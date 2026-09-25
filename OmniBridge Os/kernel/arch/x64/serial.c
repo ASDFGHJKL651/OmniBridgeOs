@@ -60,3 +60,29 @@ void serial_printf(const char *fmt, ...)
 
     serial_puts(buf);
 }
+
+/* ============================================================
+ * ★ 第 18C 步：串口输入（非中断轮询）
+ *
+ * 人工必须审查：
+ *   - 本实现使用轮询方式读取 COM1（bit 0 of LSR at 0x3FD 表示
+ *     "数据就绪"），不依赖 IRQ4 中断。
+ *   - 上层（tty.c / OShell）在主循环中周期性调用 serial_getc_nonblock
+ *     即可。
+ *   - 若后续需要真正的中断驱动，可将本函数改为 IRQ4 处理程序。
+ * ============================================================ */
+char serial_getc_nonblock(void)
+{
+    uint8_t lsr = serial_inb(COM1_PORT + 5);
+    if (!(lsr & 0x01)) return 0;    /* 无数据 */
+    return (char)serial_inb(COM1_PORT);
+}
+
+/* 打开 COM1 的"接收数据可用"中断（用于未来 IRQ4 驱动路径）。 */
+void serial_enable_rx_irq(void)
+{
+    uint8_t ier = serial_inb(COM1_PORT + 1);
+    ier |= 0x01;      /* bit 0 = Received Data Available interrupt */
+    serial_outb(COM1_PORT + 1, ier);
+    serial_printf("[SERIAL] RX IRQ enabled (IER=0x%x)\n", (unsigned)ier);
+}

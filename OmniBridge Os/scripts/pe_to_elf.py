@@ -85,14 +85,52 @@ def read_pe(path):
 
 def write_elf(pe, out_path, lma_base, vma_base):
     # 1) 挑选要加载的 section
-    #    丢弃 MEM_DISCARDABLE（调试、重定位、异常信息等）
-    #    保留 vsize > 0，包括 .bss（size_raw=0）
+    #
+    # ★★★ 第 18C 步关键修复 ★★★
+    #
+    # 原实现基于 IMAGE_SCN_MEM_DISCARDABLE 标志跳过段：
+    #     if s["char"] & IMAGE_SCN_MEM_DISCARDABLE:
+    #         continue
+    #
+    # 问题：lld-link 生成的 .bss 段（size_raw==0 且 vsize>0）会被
+    # 打上 DISCARDABLE 标志。这导致 .bss 段被本函数丢弃，ELF 中
+    # 就没有覆盖 BSS 的 PT_LOAD。
+    #
+    # 后果链：
+    #   - ELF 中缺少 .bss 段
+    #   - UEFI 侧 elf_load 计算的 phys_end 只到 .data 段末尾
+    #   - pmm_init 的排除范围未覆盖内核 BSS 物理页
+    #   - 用户程序 brk 分配时 PMM 返回 BSS 物理页
+    #   - 用户程序写入覆写 g_users[] 等内核 BSS 变量
+    #   - OShell-TEST 的 login/passwd 失败（找不到 root 用户）
+    #
+    # 修复：BSS 段（size_raw==0 && vsize>0）必须保留，无论它是否
+    # 带 DISCARDABLE 标志。只有非 BSS 的 DISCARDABLE 段才被跳过。
+    #
+    # 人工必须审查：
+    #   - 判断"是 BSS"的条件是 size_raw==0 且 vsize>0；
+    #   - 带实际数据的 DISCARDABLE 段（如 .debug_info、.pdata、
+    #     .xdata、.reloc）仍会被跳过，这是期望行为；
+    #   - 如果一个段 size_raw>0 且带 DISCARDABLE，我们假定它是真正
+    #     可丢弃的调试/元数据段，跳过是对的。
     keep = []
     for s in pe["sections"]:
         if s["vsize"] == 0 and s["size_raw"] == 0:
             continue
-        if s["char"] & IMAGE_SCN_MEM_DISCARDABLE:
+
+        is_bss = (s["size_raw"] == 0 and s["vsize"] > 0)
+
+        if not is_bss and (s["char"] & IMAGE_SCN_MEM_DISCARDABLE):
+            print(f"[pe_to_elf] skip DISCARDABLE section {s['name']:<8} "
+                  f"vsize=0x{s['vsize']:x} raw=0x{s['size_raw']:x}",
+                  flush=True)
             continue
+
+        if is_bss:
+            print(f"[pe_to_elf] KEEP BSS section {s['name']:<8} "
+                  f"vsize=0x{s['vsize']:x} (raw=0)",
+                  flush=True)
+
         keep.append(s)
 
     # 按 RVA 排序
@@ -204,9 +242,20 @@ def write_elf(pe, out_path, lma_base, vma_base):
             f.write(b"\0" * gap)
         f.write(payload)
 
+    # 8) 计算并打印 phys_end（最后一个 PT_LOAD 的 paddr + memsz）
+    #    ★ 第 18C 步：这个值会随 ELF 头一起被 UEFI 端解析，
+    #    用于 pmm_init 排除内核物理范围。BSS 段被保留后，这里会
+    #    正确包含 BSS 的物理结束地址。
+    phys_end = 0
+    for ph in phs:
+        end = ph["paddr"] + ph["memsz"]
+        if end > phys_end:
+            phys_end = end
+
     print(f"[pe_to_elf] wrote {out_path}: {phnum} PT_LOAD, "
           f"entry=0x{entry_vma:016x}, "
-          f"total_file=0x{data_off + len(payload):x}",
+          f"total_file=0x{data_off + len(payload):x}, "
+          f"phys_end=0x{phys_end:x}",
           flush=True)
 
 

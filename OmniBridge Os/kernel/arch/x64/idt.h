@@ -32,6 +32,9 @@ void idt_init(void);
 /* 异常处理（isr_common 调用），不返回 */
 void exception_handler(struct regs *r);
 
+/* 页错误处理（vector 14）。由 exception_handler 分派。不返回。 */
+void page_fault_handler(struct regs *r);
+
 /* IRQ 处理（irq_common 调用），返回后由汇编 iretq */
 void irq_handler(struct regs *r);
 

@@ -58,11 +58,17 @@ void gdt_init(void)
     /* 0：null 描述符 */
     for (int i = 0; i < 8; ++i) ((uint8_t *)&g_gdt[0])[i] = 0;
 
-    /* 1..4 普通段 */
+    /* 1..4 普通段
+     * 修复：交换用户数据段与用户代码段，使 SYSRET 能正确加载。
+     * 索引 1: kernel code  0x08
+     * 索引 2: kernel data  0x10
+     * 索引 3: user data    0x18 | 3 = 0x1B
+     * 索引 4: user code    0x20 | 3 = 0x23
+     */
     set_gate(1, 0x9A, 0xA0);   /* kernel code */
     set_gate(2, 0x92, 0xA0);   /* kernel data */
-    set_gate(3, 0xFA, 0xA0);   /* user code */
-    set_gate(4, 0xF2, 0xA0);   /* user data */
+    set_gate(3, 0xF2, 0xA0);   /* user data  (0x1B) */
+    set_gate(4, 0xFA, 0xA0);   /* user code  (0x23) */
 
     /* 5/6：TSS 描述符 */
     struct tss_entry *t = tss_get();
@@ -73,7 +79,7 @@ void gdt_init(void)
 
     gdt_flush((uint64_t)(uintptr_t)&g_gdtp);
 
-    serial_printf("[GDT] loaded 7 entries (null|kcode|kdata|ucode|udata|TSS.lo|TSS.hi)\n");
+    serial_printf("[GDT] loaded 7 entries (null|kcode|kdata|udata|ucode|TSS.lo|TSS.hi)\n");
     serial_printf("[GDT] TSS base=0x%llx limit=0x%x sel=0x28\n",
                   (unsigned long long)(uint64_t)(uintptr_t)t,
                   (unsigned)(sizeof(*t) - 1));

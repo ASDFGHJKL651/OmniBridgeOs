@@ -1,3 +1,6 @@
+/* ============================================================
+ * kernel/arch/x64/slab.c
+ * ============================================================ */
 #include "slab.h"
 #include "pmm.h"
 #include "printk.h"
@@ -265,4 +268,25 @@ void kmem_cache_destroy(struct kmem_cache *c)
 
     c->magic = 0;
     spin_unlock_irqrestore(&c->lock, flags);
+}
+
+/* ============================================================
+ * 第 13 步新增：cache 遍历接口（供 OShell meminfo 使用）
+ * ============================================================ */
+
+uint32_t slab_cache_count(void)
+{
+    return (uint32_t)g_cache_count;
+}
+
+void slab_walk(void (*cb)(const struct kmem_cache *c, void *arg), void *arg)
+{
+    if (!cb) return;
+
+    for (int i = 0; i < g_cache_count; ++i) {
+        const struct kmem_cache *c = &g_cache_pool[i];
+        if (c->magic == SLAB_MAGIC) {
+            cb(c, arg);
+        }
+    }
 }

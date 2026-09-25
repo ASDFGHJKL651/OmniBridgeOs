@@ -1,3 +1,4 @@
+/*===OmniBridgeOs/kernel/arch/x64/pmm.c===*/
 #include "pmm.h"
 #include "printk.h"
 #include "serial.h"
@@ -6,26 +7,26 @@
 /*
  * 物理内存伙伴系统 —— SMP 安全版本。
  *
- * SMP 安全设计（人工必须审查）：
- *   - 全部伙伴系统操作（分配/释放/统计）均持有单一全局自旋锁 pmm_lock。
- *     这是最简单也最保守的方案；在单核阶段开销可忽略，双核阶段会有一
- *     定争用，但正确性优先。
- *   - mark_region_usable 只在 pmm_init 期间调用，此时尚无并发，无需锁。
- *   - free_count 的读取也加锁，保证 64 位读写在 32 位原子性不会出现撕裂
- *     （x86_64 上 64 位自然对齐读写在硬件层已原子，但锁仍保证与写者的
- *     一致性，避免编译器重排）。
- *   - 后续可以加入每 CPU 页帧缓存以减少争用；本步先给出正确版本。
+ * ★★★ 第 18C 步关键崩溃修复（第四版）★★★
  *
- * 内存序：所有对 mem_map 与 free_lists 的访问都在 pmm_lock 内进行，不
- * 需要额外的 barrier。
+ *   症状：
+ *     - OShell-TEST 的 login / passwd 三个用例失败
+ *     - signal_test 触发内核态 #PF 并 panic
  *
- * free_count 记账不变量（人工必须审查）：
- *   - free_count 恒等于「当前空闲物理页总数」。
- *   - 分配一个 order-k 块：free_count 减 2^k（无论是否发生拆分）。
- *   - 释放一个 order-k 块：free_count 增 2^k（无论是否发生合并）。
- *   - 因此 pmm_free_pages 的增量必须始终基于「释放时的原始 order」，
- *     不能在合并循环里用被抬高的 order —— 否则每次合并都会重复计算
- *     buddy 已计入的页数，导致 free_count 单调膨胀（超过 total_pages）。
+ *   根因 A（BSS 未排除）：
+ *     lld-link 生成的 .bss 段带 DISCARDABLE 标志，pe_to_elf.py 将其
+ *     跳过 → elf_load 的 phys_end 仅到 .data 段结束 → pmm_init 未排
+ *     除内核 BSS 所在的物理页 → 用户程序 brk 分配时覆写 g_users[]
+ *     等 BSS 变量。
+ *
+ *     修复方式：在 pmm_init 中，无论 phys_end 计算是否准确，都把排除
+ *     范围的下限扩展到 16MB（覆盖整个内核镜像 + BSS + 早期堆）。
+ *
+ *   根因 B（user_resume clobber）：
+ *     见 user/user_resume.S 的注释。与本文件无关。
+ *
+ *   本版本改动：
+ *     - 增加 MIN_KERNEL_END 兜底，确保排除范围至少到 16MB。
  */
 
 struct page mem_map[MAX_PAGES];
@@ -34,7 +35,10 @@ static struct page *free_lists[MAX_ORDER];
 static uint64_t total_pages = 0;
 static uint64_t free_count  = 0;
 
-/* 全局伙伴系统锁 */
+static uint64_t g_total_pages_snapshot = 0;
+static volatile int g_pmm_corruption_logged = 0;
+static volatile uint64_t g_reserved_free_rejected = 0;
+
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 static inline uint64_t pfn_of(const struct page *p)
@@ -48,7 +52,6 @@ static inline struct page *buddy_of(const struct page *p, int order)
     return &mem_map[pfn];
 }
 
-/* 调用者必须持有 pmm_lock */
 static void free_list_push(int order, struct page *p)
 {
     p->order = (uint8_t)order;
@@ -57,18 +60,31 @@ static void free_list_push(int order, struct page *p)
     free_lists[order] = p;
 }
 
-/* 调用者必须持有 pmm_lock */
 static struct page *free_list_pop(int order)
 {
-    struct page *p = free_lists[order];
-    if (!p) return 0;
-    free_lists[order] = p->next;
-    p->next  = 0;
-    p->flags = 0;
-    return p;
+    while (free_lists[order]) {
+        struct page *p = free_lists[order];
+
+        if (!(p->flags & PG_FREE)) {
+            printk(KERN_ERR
+                   "[PMM] free_list[%d] head pfn=%llu flags=0x%x "
+                   "not PG_FREE, discarding from list\n",
+                   order,
+                   (unsigned long long)pfn_of(p),
+                   (unsigned)p->flags);
+            free_lists[order] = p->next;
+            p->next  = 0;
+            continue;
+        }
+
+        free_lists[order] = p->next;
+        p->next  = 0;
+        p->flags = 0;
+        return p;
+    }
+    return 0;
 }
 
-/* 仅 pmm_init 调用，无并发 */
 static void mark_region_usable(uint64_t start_phys, uint64_t pages)
 {
     uint64_t start_pfn = start_phys >> PAGE_SHIFT;
@@ -105,7 +121,6 @@ static void mark_region_usable(uint64_t start_phys, uint64_t pages)
 
 void pmm_init(const struct ob_boot_info *bi)
 {
-    /* 初始化 mem_map（无并发） */
     for (uint64_t i = 0; i < MAX_PAGES; ++i) {
         mem_map[i].order      = 0;
         mem_map[i].flags      = PG_RESERVED;
@@ -120,23 +135,78 @@ void pmm_init(const struct ob_boot_info *bi)
 
     total_pages = 0;
     free_count  = 0;
+    g_total_pages_snapshot = 0;
+    g_pmm_corruption_logged = 0;
+    g_reserved_free_rejected = 0;
 
     if (!bi) {
         printk("[PMM] no boot_info, no pages registered\n");
         return;
     }
 
+    /* ============================================================
+     * ★ 第 18C 步：确定内核镜像物理范围
+     * ============================================================ */
+    uint64_t kern_start = bi->kernel_phys_start;
+    uint64_t kern_end   = bi->kernel_phys_end;
+
+    if (kern_start == 0 || kern_end <= kern_start) {
+        kern_start = 0x200000ULL;
+        kern_end   = 0x400000ULL;
+        printk("[PMM] WARN: boot_info kernel range missing, "
+               "using conservative default [0x%llx, 0x%llx)\n",
+               (unsigned long long)kern_start,
+               (unsigned long long)kern_end);
+    } else {
+        kern_start &= PAGE_MASK;
+        kern_end    = (kern_end + PAGE_SIZE - 1) & PAGE_MASK;
+    }
+
+    /* ★★★ 第 18C 步关键兜底：确保排除范围至少到 16MB ★★★
+     *
+     * 症状（BSS 未排除）：
+     *   lld-link 生成的 .bss 段带 DISCARDABLE 标志时，pe_to_elf.py
+     *   会把它跳过，导致 phys_end 只到 .data 段末尾。此时 BSS 的
+     *   mem_map[131072]（约 4MB）等变量未被排除，用户程序 brk 分配
+     *   可能覆写这些页，导致 g_users[] 等内核数据被清零。
+     *
+     * 保守兜底：
+     *   内核镜像 LMA = 0x200000；实际大小 < 1MB；BSS 中含 mem_map
+     *   4MB + 其他；总计 < 8MB。将排除范围扩展到 16MB 覆盖所有可能，
+     *   浪费约 8MB 物理内存，对 1GB QEMU 内存完全可接受。
+     *
+     * 人工必须审查：
+     *   若未来内核大小增长或 mem_map 扩大（MAX_PAGES 增加），需要
+     *   同步上调 MIN_KERNEL_END。
+     */
+    const uint64_t MIN_KERNEL_END = 0x1000000ULL;   /* 16 MB */
+    if (kern_end < MIN_KERNEL_END) {
+        printk("[PMM] kernel range extended: [0x%llx, 0x%llx) → "
+               "[0x%llx, 0x%llx) (16MB minimum)\n",
+               (unsigned long long)kern_start,
+               (unsigned long long)kern_end,
+               (unsigned long long)kern_start,
+               (unsigned long long)MIN_KERNEL_END);
+        kern_end = MIN_KERNEL_END;
+    }
+
+    printk("[PMM] kernel image physical range reserved: "
+           "[0x%llx, 0x%llx) (%llu KB)\n",
+           (unsigned long long)kern_start,
+           (unsigned long long)kern_end,
+           (unsigned long long)((kern_end - kern_start) / 1024));
+
+    /* ============================================================
+     * 遍历 UEFI 内存图，标记可用区域（扣除内核范围）
+     * ============================================================ */
     for (uint32_t i = 0; i < bi->entry_count; ++i) {
         const struct ob_memory_entry *e = &bi->memory_map[i];
         uint64_t phys  = e->physical_start;
         uint64_t pages = e->number_of_pages;
 
-        int usable = (e->type == 7 /* EfiConventionalMemory */) ||
-                     (e->type == 3 /* EfiBootServicesCode */)     ||
-                     (e->type == 4 /* EfiBootServicesData */);
+        int usable = (e->type == 7) || (e->type == 3) || (e->type == 4);
         if (!usable) continue;
 
-        /* 保留低 1MB（含 BIOS/VGA 等） */
         if (phys < 0x100000) {
             uint64_t skip = 0x100000 - phys;
             uint64_t skip_pages = (skip + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -145,8 +215,28 @@ void pmm_init(const struct ob_boot_info *bi)
             pages -= skip_pages;
         }
 
-        mark_region_usable(phys, pages);
+        uint64_t region_start = phys;
+        uint64_t region_end   = phys + pages * PAGE_SIZE;
+
+        if (region_end <= kern_start || region_start >= kern_end) {
+            mark_region_usable(region_start, pages);
+        } else {
+            if (region_start < kern_start) {
+                uint64_t head_pages = (kern_start - region_start) / PAGE_SIZE;
+                if (head_pages > 0) {
+                    mark_region_usable(region_start, head_pages);
+                }
+            }
+            if (region_end > kern_end) {
+                uint64_t tail_pages = (region_end - kern_end) / PAGE_SIZE;
+                if (tail_pages > 0) {
+                    mark_region_usable(kern_end, tail_pages);
+                }
+            }
+        }
     }
+
+    g_total_pages_snapshot = total_pages;
 
     printk("[PMM] usable pages: %llu, free: %llu\n",
            (unsigned long long)total_pages,
@@ -164,10 +254,29 @@ struct page *pmm_alloc_pages(int order)
     while (o < MAX_ORDER && !free_lists[o]) ++o;
     if (o == MAX_ORDER) {
         spin_unlock_irqrestore(&pmm_lock, flags);
-        return 0;
+
+        /* ★ 修复 1：OOM 标记（实际回收由 sched_tick -> oom_tick_reap） */
+        extern int oom_mark_victim(void);
+        oom_mark_victim();
+
+        /* 重试一次 */
+        spin_lock_irqsave(&pmm_lock, &flags);
+        o = order;
+        while (o < MAX_ORDER && !free_lists[o]) ++o;
+        if (o == MAX_ORDER) {
+            spin_unlock_irqrestore(&pmm_lock, flags);
+            return 0;
+        }
     }
 
     struct page *p = free_list_pop(o);
+
+    if (!p || p < mem_map || p >= mem_map + MAX_PAGES) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        printk(KERN_ERR "[PMM] alloc: corrupted free list, bailing\n");
+        return 0;
+    }
+
     while (o > order) {
         --o;
         struct page *buddy = buddy_of(p, o);
@@ -179,10 +288,6 @@ struct page *pmm_alloc_pages(int order)
     p->slab_cache = 0;
     p->slab_free  = 0;
 
-    /*
-     * 记账：无论是否拆分，从空闲池里取走的用户可见页数恒为 2^order。
-     * 拆分只是把一个大块重新组织成两个小块，不改变空闲页总数。
-     */
     free_count -= (1ULL << order);
 
     spin_unlock_irqrestore(&pmm_lock, flags);
@@ -193,40 +298,87 @@ void pmm_free_pages(struct page *p, int order)
 {
     if (!p || order < 0 || order >= MAX_ORDER) return;
 
-    uint64_t flags;
-    spin_lock_irqsave(&pmm_lock, &flags);
-
-    if (p->flags & PG_FREE) {
-        /* 双重释放 */
-        spin_unlock_irqrestore(&pmm_lock, flags);
-        printk("[PMM] double free detected, ignoring\n");
+    if (p < mem_map || p >= mem_map + MAX_PAGES) {
+        printk(KERN_ERR
+               "[PMM] free_pages: invalid page pointer "
+               "(out of mem_map range), ignored\n");
         return;
     }
 
-    /*
-     * 关键：先保存原始 order。
-     *
-     * 合并循环会逐步抬高 order，但 free_count 的增量必须始终等于
-     * 「本次释放的原始页数」= 1 << original_order。原因：
-     *   - buddy 若已空闲，已经计入 free_count；合并只是把两者重组成
-     *     一个更大的块，不改变空闲页总数。
-     *   - 若使用被抬高后的 order，每次合并都会额外多计 buddy 的页数，
-     *     导致 free_count 单调膨胀，压力测试下会超过 total_pages。
-     */
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+
+    if (g_total_pages_snapshot == 0) {
+        if (!g_pmm_corruption_logged) {
+            printk(KERN_ERR
+                   "[PMM] free_pages: snapshot==0, PMM accounting "
+                   "never initialized or corrupted; refusing to free\n");
+            g_pmm_corruption_logged = 1;
+        }
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return;
+    }
+    if (total_pages != g_total_pages_snapshot) {
+        if (!g_pmm_corruption_logged) {
+            printk(KERN_ERR
+                   "[PMM] total_pages=%llu != snapshot=%llu — "
+                   "counter corrupted, restoring snapshot\n",
+                   (unsigned long long)total_pages,
+                   (unsigned long long)g_total_pages_snapshot);
+            g_pmm_corruption_logged = 1;
+        }
+        total_pages = g_total_pages_snapshot;
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return;
+    }
+
+    if (p->flags & PG_RESERVED) {
+        g_reserved_free_rejected++;
+        if (g_reserved_free_rejected <= 8) {
+            printk(KERN_ERR
+                   "[PMM] free_pages: pfn=%llu is PG_RESERVED "
+                   "(not owned by pmm), refusing (count=%llu)\n",
+                   (unsigned long long)pfn_of(p),
+                   (unsigned long long)g_reserved_free_rejected);
+        } else if (g_reserved_free_rejected == 9) {
+            printk(KERN_ERR
+                   "[PMM] free_pages: too many PG_RESERVED rejections, "
+                   "suppressing further messages\n");
+        }
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return;
+    }
+
+    if (p->flags & PG_FREE) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        printk("[PMM] double free detected (pfn=%llu), ignoring\n",
+               (unsigned long long)pfn_of(p));
+        return;
+    }
+
+    if ((int)p->order != order) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        printk(KERN_ERR
+               "[PMM] free_pages: order mismatch "
+               "(caller=%d, page_header=%d, pfn=%llu), ignored\n",
+               order, (int)p->order,
+               (unsigned long long)pfn_of(p));
+        return;
+    }
+
     const int original_order = order;
 
     while (order < MAX_ORDER - 1) {
         struct page *buddy = buddy_of(p, order);
         if (!(buddy->flags & PG_FREE) || buddy->order != order) break;
 
-        /* 从 free_lists[order] 摘下 buddy（O(n) 简单实现） */
         struct page **pp = &free_lists[order];
         while (*pp && *pp != buddy) pp = &(*pp)->next;
         if (*pp == buddy) {
             *pp = buddy->next;
             buddy->next  = 0;
         } else {
-            break; /* 异常：不在链表里，不合并 */
+            break;
         }
         if (buddy < p) p = buddy;
         ++order;
@@ -234,16 +386,15 @@ void pmm_free_pages(struct page *p, int order)
     free_list_push(order, p);
     free_count += (1ULL << original_order);
 
-    /* 不变量检测：free_count 绝不应超过 total_pages。触发即计数器损坏。 */
     if (free_count > total_pages) {
         printk(KERN_ERR
                "[PMM] free_count %llu > total_pages %llu "
-               "(orig_order=%d, merged_order=%d) — counter corruption\n",
+               "(orig_order=%d, merged_order=%d) — counter corruption, "
+               "rollback this free\n",
                (unsigned long long)free_count,
                (unsigned long long)total_pages,
                original_order, order);
-        /* 保守截断，避免下游读到大得离谱的数字；同时保留错误信息便于定位 */
-        free_count = total_pages;
+        free_count -= (1ULL << original_order);
     }
 
     spin_unlock_irqrestore(&pmm_lock, flags);
@@ -266,3 +417,4 @@ uint64_t pmm_free_pages_count(void)
     spin_unlock_irqrestore(&pmm_lock, flags);
     return v;
 }
+/*===OmniBridgeOs/kernel/arch/x64/pmm.c 结束===*/

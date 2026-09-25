@@ -1,7 +1,9 @@
-//测试
+/*===OmniBridgeOs/kernel/arch/x64/main.c===*/
 #include "selftest.h"
 #include "stress.h"
-//
+#include "permission_test.h"
+#include "task_test.h"
+
 #include "boot.h"
 #include "gdt.h"
 #include "tss.h"
@@ -16,12 +18,139 @@
 #include "percpu.h"
 #include "printk.h"
 #include "serial.h"
+#include "lapic.h"
+#include "ioapic.h"
+#include "ipi.h"
+#include "sched.h"
+#include "task.h"
+#include "pid.h"
+
+#include "audit.h"
+#include "see.h"
+#include "ita.h"
+#include "sha384_test.h"
+#include "audit_test.h"
+#include "see_test.h"
+#include "obr_test.h"
+#include "ita_test.h"
+
+#include "vfs.h"
+#include "tmpfs.h"
+#include "vfs_test.h"
+#include "obfs_test.h"
+
+#include "critical.h"
+#include "critical_test.h"
+#include "oshell.h"
+#include "boot_services.h"
+#include "obinit.h"
+#include "obinit_test.h"
+
+#include "uel_test.h"
+#include "oshell_test.h"
+
+#include "rng.h"
+#include "ita_sign.h"
+#include "sha512_test.h"
+#include "ed25519_test.h"
+#include "ita_sign_test.h"
+
+#include "mem_domain.h"
+#include "mem_domain_test.h"
+#include "priv_iso.h"
+#include "priv_iso_test.h"
+
+#include "see_policy_test.h"
+#include "sandbox_test.h"
+
+#include "ita_manual_test.h"
+#include "art_test.h"
+#include "compat_preload_test.h"
+
+/* ★ 第 18 步 */
+#include "sha256_test.h"
+#include "compat_env_test.h"
+#include "compat_path_test.h"
+#include "compat_handle_test.h"
+#include "compat_object_test.h"
+#include "compat_exception_test.h"
+
+/* ★ 第 18A 步：网络 */
+#include "net/net.h"
+#include "net/netns.h"
+#include "net/net_selftest.h"
+
+/* ★ 第 18B 步：块层与可写 OBFS */
+#include "block/block.h"
+#include "block/virtio_blk.h"
+#include "block/page_cache.h"
+#include "block/journal.h"
+#include "block/fsck.h"
+#include "block/quota.h"
+#include "block/xattr.h"
+#include "block/symlink.h"
+#include "block/crypto.h"
+#include "block/obfs_rw.h"
+#include "block/mkfs.h"
+#include "block/block_selftest.h"
+
+/* ★ 第 18C 步：用户态运行时与多用户基础 */
+#include "user/user.h"
+#include "user/signal.h"
+#include "user/tty.h"
+#include "user/account.h"
+#include "user/elf_loader.h"
+#include "user_test.h"
+
+#include "futex.h"
+#include "pipefs.h"
+#include "select.h"
+#include "seccomp.h"
+#include "oom.h"
+#include "ptrace.h"
+#include "namespace.h"
+
+#include "user/win32_api.h"
+#include "user/win32_compat_test.h"
+
+extern void user_launcher_entry(void *arg);
+
+extern const uint8_t  g_embedded_syscall_test[];
+extern const uint64_t g_embedded_syscall_test_len;
+extern const uint8_t  g_embedded_hello[];
+extern const uint64_t g_embedded_hello_len;
+extern const uint8_t  g_embedded_fs_test[];
+extern const uint64_t g_embedded_fs_test_len;
+extern const uint8_t  g_embedded_exception_test[];
+extern const uint64_t g_embedded_exception_test_len;
+/* ★ 第 18C 步新增内嵌程序 */
+extern const uint8_t  g_embedded_signal_test[];
+extern const uint64_t g_embedded_signal_test_len;
+extern const uint8_t  g_embedded_pthread_test[];
+extern const uint64_t g_embedded_pthread_test_len;
+extern const uint8_t  g_embedded_dyn_test[];
+extern const uint64_t g_embedded_dyn_test_len;
+extern const uint8_t  g_embedded_libfoo[];
+extern const uint64_t g_embedded_libfoo_len;
+
+extern const uint8_t  g_embedded_pipe_test[];
+extern const uint64_t g_embedded_pipe_test_len;
+
+extern const uint8_t  g_embedded_linux_hello[];
+extern const uint64_t g_embedded_linux_hello_len;
+
+extern const uint8_t  g_embedded_win32_api_test[];
+extern const uint64_t g_embedded_win32_api_test_len;
+
+extern void user_test_driver_entry(void *arg);
+
+/* ★ 第 18D 步 */
+void test_18d(void);
 
 #ifdef OB_QEMU_EXIT
 extern void qemu_exit(uint32_t code);
 #endif
 
-/* entry_kernel.S 导出，用作 TSS.rsp0 的内核栈顶 */
 extern uint8_t kernel_stack_top[];
 
 static void banner(void)
@@ -29,11 +158,172 @@ static void banner(void)
     printk("Hello Kernel\n");
 }
 
-/* 由 entry_kernel.S 调用；RCX = UEFI 传过来的 &g_boot_info（MS ABI 参数 1） */
+static volatile uint64_t g_a_iters = 0;
+static volatile uint64_t g_b_iters = 0;
+
+static void busy_wait(volatile int n)
+{
+    while (n-- > 0) {
+        __asm__ __volatile__("pause" ::: "memory");
+    }
+}
+
+static void thread_a(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 5; ++i) {
+        g_a_iters++;
+        serial_printf("[A] iter=%d (tid current=%llu)\n",
+                      i,
+                      (unsigned long long)sched_current()->tid);
+        busy_wait(2000000);
+    }
+    serial_printf("[A] done\n");
+    thread_exit();
+}
+
+static void thread_b(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 5; ++i) {
+        g_b_iters++;
+        serial_printf("[B] iter=%d\n", i);
+        busy_wait(500000);
+        thread_yield();
+    }
+    serial_printf("[B] done\n");
+    thread_exit();
+}
+
+extern void net_tick(void);
+
+static void thread_idle(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        net_tick();
+
+        /* ★★★ 修复 7：回收 orphan zombie ★★★
+         *
+         * 人工必须审查：
+         *   - init/secmgr/servicehost/auditd/user-driver 等 parent_pid==0
+         *     的 task 退出后无人 join，必须由 idle 线程回收。
+         *   - task_reap_orphans 内部每次最多处理 8 个，避免长时占用。
+         *   - idle 线程是唯一持有"回收 orphan"职责的线程。 */
+        extern void task_reap_orphans(void);
+        task_reap_orphans();
+
+        __asm__ __volatile__("hlt");
+    }
+}
+
+/* ============================================================
+ * 把内嵌的用户程序写入根文件系统。
+ * ============================================================ */
+static int embed_install_one(const char *path,
+                             const uint8_t *data, uint64_t len)
+{
+    (void)vfs_unlink(path);
+
+    struct vfs_file *f = 0;
+    int rc = vfs_open(path, VFS_O_CREAT | VFS_O_WRONLY, &f);
+    if (rc != 0 || !f) {
+        serial_printf("[EMBED] open '%s' failed rc=%d\n", path, rc);
+        return rc ? rc : OB_EIO;
+    }
+
+    int64_t nw = vfs_write(f, data, len);
+    vfs_close(f);
+
+    if (nw != (int64_t)len) {
+        serial_printf("[EMBED] write '%s' failed nw=%lld len=%llu\n",
+                      path, (long long)nw, (unsigned long long)len);
+        return OB_EIO;
+    }
+    serial_printf("[EMBED] installed '%s' (%llu bytes)\n",
+                  path, (unsigned long long)len);
+    return 0;
+}
+
+static void embed_install_programs(void)
+{
+    int rc = vfs_mkdir("/bin", 0755);
+    if (rc != 0 && rc != OB_EEXIST) {
+        serial_printf("[EMBED] mkdir /bin rc=%d (continuing)\n", rc);
+    }
+
+    rc = vfs_mkdir("/tmp", 0777);
+    if (rc != 0 && rc != OB_EEXIST) {
+        serial_printf("[EMBED] mkdir /tmp rc=%d (continuing)\n", rc);
+    }
+
+    rc = vfs_mkdir("/home", 0755);
+    if (rc != 0 && rc != OB_EEXIST) {
+        serial_printf("[EMBED] mkdir /home rc=%d (continuing)\n", rc);
+    }
+
+    (void)embed_install_one("/bin/syscall_test.obr",
+                            g_embedded_syscall_test,
+                            g_embedded_syscall_test_len);
+    (void)embed_install_one("/bin/hello.obr",
+                            g_embedded_hello,
+                            g_embedded_hello_len);
+    (void)embed_install_one("/bin/fs_test.obr",
+                            g_embedded_fs_test,
+                            g_embedded_fs_test_len);
+    (void)embed_install_one("/bin/exception_test.obr",
+                            g_embedded_exception_test,
+                            g_embedded_exception_test_len);
+    /* ★ 第 18C 步新增 */
+    (void)embed_install_one("/bin/signal_test.obr",
+                            g_embedded_signal_test,
+                            g_embedded_signal_test_len);
+    (void)embed_install_one("/bin/pthread_test.obr",
+                            g_embedded_pthread_test,
+                            g_embedded_pthread_test_len);
+    (void)embed_install_one("/bin/dyn_test.obr",
+                            g_embedded_dyn_test,
+                            g_embedded_dyn_test_len);
+    (void)embed_install_one("/bin/pipe_test.obr",
+                            g_embedded_pipe_test,
+                            g_embedded_pipe_test_len);
+
+    /* ★ 第 18C 步：为动态链接测试准备 /system/lib/ 目录 */
+    (void)vfs_mkdir("/system", 0755);
+    (void)vfs_mkdir("/system/lib", 0755);
+    (void)embed_install_one("/system/lib/libfoo.obr",
+                            g_embedded_libfoo,
+                            g_embedded_libfoo_len);
+    
+    if (g_embedded_linux_hello_len > 0) {
+        (void)embed_install_one("/bin/linux_hello.elf",
+                                g_embedded_linux_hello,
+                                g_embedded_linux_hello_len);
+    } else {
+        serial_printf("[EMBED] WARN: linux_hello.elf not built "
+                      "(host clang/ld.lld missing?)\n");
+    }
+        /* ★ 第 20 步：Win32 PE 测试 */
+    extern const uint8_t  g_embedded_win32_hello[];
+    extern const uint64_t g_embedded_win32_hello_len;
+    if (g_embedded_win32_hello_len > 0) {
+        (void)embed_install_one("/bin/win32_hello.exe",
+                                g_embedded_win32_hello,
+                                g_embedded_win32_hello_len);
+    } else {
+        serial_printf("[EMBED] WARN: win32_hello.exe not built\n");
+    }
+    if (g_embedded_win32_api_test_len > 0) {
+        (void)embed_install_one("/bin/win32_api_test.exe",
+                                g_embedded_win32_api_test,
+                                g_embedded_win32_api_test_len);
+    } else {
+        serial_printf("[EMBED] WARN: win32_api_test.exe not built\n");
+    }
+}
+
 void _kstart_c(struct ob_boot_info *bi)
 {
-    /* UEFI 侧 boot_info 位于 UEFI 镜像 BSS，随时可能被覆盖，
-     * 第一件事就是整体复制到内核自己的 BSS。 */
     static struct ob_boot_info local_bi;
     if (bi) {
         uint8_t *src = (uint8_t *)bi;
@@ -47,25 +337,45 @@ void _kstart_c(struct ob_boot_info *bi)
         goto halt;
     }
 
-    /* ---------- 第 4 步：GDT / TSS / IDT / PIC / SYSCALL ---------- */
-    gdt_init();                                        /* 加载 7 项 GDT（含 TSS 描述符） */
-    tss_init((uint64_t)(uintptr_t)kernel_stack_top);   /* 设置 rsp0 + ltr 0x28 */
-    idt_init();                                        /* 0-31 异常 + 32-47 IRQ */
-    pic_init();                                        /* 8259 重映射，屏蔽全部 IRQ */
-    pit_init(100);                                     /* PIT 100 Hz -> IRQ0 */
-    pic_unmask(0);                                     /* 仅打开 IRQ0 定时器 */
-    syscall_init();                                    /* EFER.SCE / STAR / LSTAR / FMASK */
+    gdt_init();
+    tss_init((uint64_t)(uintptr_t)kernel_stack_top);
+    idt_init();
+    pic_init();
+    pit_init(100);
 
-    /* ---------- 第 5 步：内存子系统（SMP-safe） ---------- */
-    percpu_init();                                     /* 每 CPU 变量基础设施 */
-    pmm_init(bi);                                      /* 伙伴系统（自旋锁保护） */
-    vmm_init();                                        /* 4 级分页 */
-    slab_init();                                       /* SLAB 子系统 */
-    kmalloc_init();                                    /* kmalloc 大小类（基于 SLAB） */
+    lapic_init();
+    ioapic_init();
+    ipi_init();
+    lapic_timer_init(100);
+
+    percpu_init();
+    pmm_init(bi);
+
+    vmm_init();
+    vmm_enable_smep_smap();
+    serial_printf("[KRN] VMM stage done (CR3 + SMEP/SMAP)\n");
+
+    slab_init();
+    kmalloc_init();
+
+    syscall_init();
+
+    audit_init();
+    see_init();
+    ita_init();
+
+    rng_init();
+    {
+        int ita2_rc = ita_sign_init();
+        if (ita2_rc != 0) {
+            serial_printf("[ITA2] WARN: sign subsystem not ready "
+                          "(rc=%d), official .obr will be rejected\n",
+                          ita2_rc);
+        }
+    }
 
     banner();
 
-    /* ---------- 极简启动自检：kmalloc/kzalloc 往返 ---------- */
     void *p = kmalloc(64);
     if (!p) {
         printk(KERN_ERR "kmalloc(64) failed\n");
@@ -80,10 +390,8 @@ void _kstart_c(struct ob_boot_info *bi)
         goto fail;
     }
     kfree(q);
-
     printk("kmalloc OK\n");
 
-    /* ---------- 第 5 步压力测试（编译期开关 OB_STRESS_LEVEL） ---------- */
 #if OB_STRESS_LEVEL != OB_STRESS_NONE
     {
         int rc = stress_run(OB_STRESS_LEVEL);
@@ -102,21 +410,310 @@ void _kstart_c(struct ob_boot_info *bi)
                     OB_SELFTEST_STEP);
     #endif
 
-    /* ---------- 打开中断，观察 PIT tick ---------- */
-    __asm__ __volatile__("sti");
-    printk("[KRN] interrupts enabled, waiting for PIT ticks...\n");
+    pid_init();
+    task_init();
+    permission_selftest();
 
-    /* 约 1 秒（100 Hz 下 100 次 hlt 就够，多 hlt 一些更保险） */
-    for (int i = 0; i < 300; ++i) {
-        __asm__ __volatile__("hlt");
+    sha384_test();
+    audit_test();
+    see_test();
+    see_policy_test();
+    sandbox_test();
+    obr_test();
+    ita_test();
+
+    sha512_test();
+    ed25519_test();
+    ita_sign_test();
+
+    /* ★ 第 17 步：ITA 完整与 ART 预加载 */
+    serial_printf("[KRN] step 17: ITA complete and ART preload\n");
+    ita_manual_test();
+    art_test();
+    compat_preload_test();
+    serial_printf("[KRN] WARN: step 17 shared memory is kernel-mode "
+                  "approximation (no CPL=3 yet)\n");
+    serial_printf("[KRN] WARN: step 17 ART uses SHA-384 truncated to 64-bit, "
+                  "TODO replace with SHA-256 in step 18+\n");
+
+    /* ★ 第 18 步：兼容层基础与异常转换 */
+    serial_printf("[KRN] step 18: compat layer base and exception translation\n");
+    sha256_test();
+    compat_env_test();
+    compat_path_test();
+    compat_handle_test();
+    compat_object_test();
+    compat_exception_test();
+    serial_printf("[KRN] WARN: step 18 does not introduce CPL=3 user mode; "
+                  "compat layer is kernel-mode simulation\n");
+
+    /* ★ 第 18A 步：网络协议栈基础 */
+    serial_printf("[KRN] step 18A: network stack base\n");
+    net_init();
+    net_selftest();
+    serial_printf("[KRN] WARN: step 18A uses kernel-mode sockets; "
+                  "no CPL=3 user networking yet\n");
+
+    /* ============================================================
+     * ★ 第 18B 步：块层与可写持久文件系统
+     * ============================================================ */
+    vfs_init();
+
+    block_init();
+    pcache_init();
+    journal_init();
+    quota_init();
+    xattr_init();
+    symlink_init();
+    crypto_init();
+
+    if (virtio_blk_init() == 0) {
+        struct block_device *bdev = virtio_blk_device();
+        serial_printf("[BLOCK] VirtIO block device ready: %s "
+                      "sectors=%llu\n",
+                      bdev ? bdev->name : "(null)",
+                      (unsigned long long)(bdev ? bdev->total_sectors : 0));
+
+        if (bdev && !obfs_is_formatted(bdev, 0)) {
+            uint64_t tb = (bdev->total_sectors * 512) / PAGE_SIZE;
+            serial_printf("[BLOCK] image not formatted, running mkfs\n");
+            int frc = obfs_format(bdev, 0, tb, 256);
+            if (frc == 0) {
+                serial_printf("[BLOCK] mkfs.obfs complete\n");
+            } else {
+                serial_printf("[BLOCK] mkfs.obfs failed rc=%d\n", frc);
+            }
+        }
+
+        if (bdev) {
+            uint64_t tb = (bdev->total_sectors * 512) / PAGE_SIZE;
+            fsck_init();
+            int frc = fsck_run(bdev, 0, tb, 1);
+            if (frc == 0) {
+                serial_printf("[FSCK] clean\n");
+            } else if (frc > 0) {
+                serial_printf("[FSCK] WARN: inconsistencies detected\n");
+            }
+        }
+    } else {
+        serial_printf("[BLOCK] no VirtIO block device found\n");
     }
 
-    printk("[KRN] PIT observed, entering idle loop\n");
+    vfs_test();
 
-#ifdef OB_QEMU_EXIT
-    qemu_exit(0);
-#endif
-    goto halt;
+    block_selftest();
+
+    obfs_test();
+
+    /* ============================================================
+     * 根文件系统挂载：优先 OBFS-RW；回退 tmpfs
+     * ============================================================ */
+    {
+        int root_mounted = 0;
+
+        if (virtio_blk_ready()) {
+            struct block_device *bdev = virtio_blk_device();
+            if (bdev) {
+                uint64_t tb = (bdev->total_sectors * 512) / PAGE_SIZE;
+                struct vfs_superblock *obfs_sb =
+                    obfs_rw_mount(bdev, 0, tb);
+                if (obfs_sb) {
+                    int rc = vfs_mount("/", obfs_sb);
+                    if (rc == 0) {
+                        serial_printf("[OBFS-RW] mounted root\n");
+                        root_mounted = 1;
+                    } else {
+                        serial_printf("[OBFS-RW] root mount failed rc=%d, "
+                                      "fallback to tmpfs\n", rc);
+                        obfs_rw_umount(obfs_sb);
+                    }
+                } else {
+                    serial_printf("[OBFS-RW] mount failed, "
+                                  "fallback to tmpfs\n");
+                }
+            }
+        }
+
+        if (!root_mounted) {
+            struct vfs_superblock *rootfs =
+                tmpfs_mount("rootfs", 64ULL * 1024 * 1024);
+            if (rootfs) {
+                int rc = vfs_mount("/", rootfs);
+                if (rc != 0) {
+                    serial_printf("[KRN] root tmpfs mount failed rc=%d\n", rc);
+                    tmpfs_umount(rootfs);
+                } else {
+                    serial_printf("[KRN] root tmpfs mounted, mounts=%u\n",
+                                  (unsigned)vfs_mount_count());
+                }
+            }
+        }
+    }
+
+    embed_install_programs();
+    account_init();
+    tty_init();
+    critical_init();
+    critical_test();
+    oshell_run();
+
+    uel_test();
+    oshell_init();
+    oshell_test();
+
+    serial_printf("[KRN] step 15: privilege 0/1 isolation "
+                  "(CPL=0 approximation)\n");
+    mem_domain_test();
+    priv_iso_test();
+
+    serial_printf("[KRN] step 16: SEE complete and U-Sandbox\n");
+    serial_printf("[KRN] WARN: step 16 does not introduce CPL=3 user mode; "
+                  "sandbox isolation is approximate\n");
+
+    /* ============================================================
+     * ★ 第 18C 步：用户态运行时与多用户基础
+     * ============================================================ */
+    serial_printf("[KRN] step 18C: user-mode runtime and multiuser base\n");
+    signal_init();
+    user_init();
+    elf_loader_init();
+    user_test();
+    serial_printf("[KRN] WARN: step 18C user-mode runtime is framework-only; "
+                  "CPL=3 iretq path is implemented but not yet auto-triggered\n");
+
+    sched_init();
+
+    if (boot_services_default() != 0) {
+        printk(KERN_ERR "[KRN] boot services failed\n");
+        goto fail;
+    }
+
+    obinit_test();
+
+    if (!thread_create("idle", thread_idle, 0, 0)) {
+        printk(KERN_ERR "[KRN] cannot create idle thread\n");
+        goto fail;
+    }
+    if (!thread_create("B", thread_b, 0, 3)) {
+        printk(KERN_ERR "[KRN] cannot create thread B\n");
+        goto fail;
+    }
+    if (!thread_create("A", thread_a, 0, 5)) {
+        printk(KERN_ERR "[KRN] cannot create thread A\n");
+        goto fail;
+    }
+
+    /* ============================================================
+     * ★ 第 18C 步：启动用户态测试驱动内核线程。
+     * ============================================================ */
+    {
+        static const char driver_name[] = "user-driver";
+        struct task_t *dt = task_create(driver_name,
+                                        user_test_driver_entry,
+                                        0,
+                                        0,
+                                        0,
+                                        5,
+                                        0,
+                                        0);
+        if (!dt) {
+            printk(KERN_WARN "[KRN] cannot create user-driver task; "
+                             "user-mode verification skipped\n");
+        } else {
+            serial_printf("[KRN] user-test driver created: pid=%llu\n",
+                          (unsigned long long)dt->pid);
+        }
+    }
+
+    /* ============================================================
+     * ★ 第 18D 步：IPC、资源控制与命名空间
+     * ============================================================ */
+    serial_printf("[KRN] step 18D: IPC, resource control and namespaces\n");
+    futex_init();
+    pipefs_init();
+    select_init();
+    seccomp_init();
+    oom_init();
+    ptrace_init();
+    namespace_init();
+    test_18d();   /* ★ 新增：执行 18D 自检 */
+    serial_printf("[KRN] WARN: step 18D cross-process shm is "
+                  "single-process approximation\n");
+
+    /* ============================================================
+     * ★ 第 19 步：Linux ELF 兼容层
+     * ============================================================ */
+    serial_printf("[KRN] step 19: Linux ELF compatibility\n");
+
+    /* 初始化 */
+    extern void procfs_init(void);
+    extern void devfs_init(void);
+    extern void sysfs_init(void);
+    extern struct vfs_superblock *procfs_mount(void);
+    extern struct vfs_superblock *sysfs_mount(void);
+    extern struct vfs_superblock *devfs_mount(void);
+    extern void linux_syscall_init(void);
+    extern void linux_compat_selftest(void);
+
+    procfs_init();
+    sysfs_init();
+    devfs_init();
+    linux_syscall_init();
+
+    /* 挂载 /proc、/sys、/dev（在根 fs 挂载之后，即 embed_install_programs 之后） */
+    (void)vfs_mkdir("/proc", 0755);
+    (void)vfs_mkdir("/sys",  0555);
+    (void)vfs_mkdir("/dev",  0755);
+
+    {
+        struct vfs_superblock *sb_p = procfs_mount();
+        if (sb_p) {
+            int mrc = vfs_mount("/proc", sb_p);
+            if (mrc != 0) {
+                serial_printf("[KRN] procfs mount rc=%d\n", mrc);
+                if (sb_p->ops && sb_p->ops->destroy_sb)
+                    sb_p->ops->destroy_sb(sb_p);
+            }
+        }
+    }
+    {
+        struct vfs_superblock *sb_s = sysfs_mount();
+        if (sb_s) {
+            int mrc = vfs_mount("/sys", sb_s);
+            if (mrc != 0) {
+                serial_printf("[KRN] sysfs mount rc=%d\n", mrc);
+                if (sb_s->ops && sb_s->ops->destroy_sb)
+                    sb_s->ops->destroy_sb(sb_s);
+            }
+        }
+    }
+    {
+        struct vfs_superblock *sb_d = devfs_mount();
+        if (sb_d) {
+            int mrc = vfs_mount("/dev", sb_d);
+            if (mrc != 0) {
+                serial_printf("[KRN] devfs mount rc=%d\n", mrc);
+                if (sb_d->ops && sb_d->ops->destroy_sb)
+                    sb_d->ops->destroy_sb(sb_d);
+            }
+        }
+    }
+
+    linux_compat_selftest();
+    serial_printf("[KRN] WARN: step 19 supports static ELF64 only; "
+                  "PT_INTERP rejected\n");
+
+    /* ============================================================
+     * ★ 第 20 步：Windows PE 子集
+     * ============================================================ */
+    serial_printf("[KRN] step 20: Windows PE subset\n");
+    win32_api_init();
+    win32_compat_selftest();
+    serial_printf("[KRN] WARN: step 20 supports minimal PE32+ EXE with "
+                  "static IAT; no DLL loading, no SEH, no TLS callbacks\n");
+
+    printk("[KRN] starting scheduler...\n");
+    sched_start();
 
 fail:
 #ifdef OB_QEMU_EXIT
@@ -125,3 +722,4 @@ fail:
 halt:
     for (;;) { __asm__ __volatile__("hlt"); }
 }
+/*===OmniBridgeOs/kernel/arch/x64/main.c 结束===*/

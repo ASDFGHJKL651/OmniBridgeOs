@@ -1,3 +1,6 @@
+/* ============================================================
+ * kernel/arch/x64/slab.h
+ * ============================================================ */
 #ifndef OMNIBRIDGE_SLAB_H
 #define OMNIBRIDGE_SLAB_H
 
@@ -58,5 +61,15 @@ void kmem_cache_destroy(struct kmem_cache *c);
 
 void *kmem_cache_alloc(struct kmem_cache *c);
 void  kmem_cache_free (struct kmem_cache *c, void *obj);
+
+/*
+ * 遍历所有已创建的 cache。
+ * 回调在持有 slab 内部锁之外被调用（不需要持锁）；
+ * 回调只读字段，不得分配/释放。
+ */
+void slab_walk(void (*cb)(const struct kmem_cache *c, void *arg), void *arg);
+
+/* 已创建的 cache 数量。 */
+uint32_t slab_cache_count(void);
 
 #endif /* OMNIBRIDGE_SLAB_H */
